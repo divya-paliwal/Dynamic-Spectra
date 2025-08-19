@@ -1,0 +1,369 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+import numpy as np
+import matplotlib.pyplot as plt
+from astropy.io import fits
+from astropy.time import Time, TimeDelta
+from datetime import datetime, timedelta
+from glob import glob
+from matplotlib.dates import date2num, num2date, DateFormatter
+from scipy.interpolate import RegularGridInterpolator
+from matplotlib.ticker import LogLocator, ScalarFormatter, NullFormatter
+from matplotlib import dates as mdates
+#from matplotlib.ticker import ScalarFormatter
+from matplotlib.ticker import LogLocator, ScalarFormatter
+from matplotlib.widgets import Cursor
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def _ensure_time_freq_order(times, freqs, data_tf):
+    """
+    Ensure (times ascending, freqs ascending), with data shaped (time, freq).
+    """
+    # times: list/array of datetimes
+    tnum = date2num(times)
+    if not np.all(np.diff(tnum) >= 0):
+        idx = np.argsort(tnum)
+        tnum = tnum[idx]
+        data_tf = data_tf[idx, :]
+
+    # freqs ascending
+    if freqs[0] > freqs[-1]:
+        freqs = freqs[::-1]
+        data_tf = data_tf[:, ::-1]
+
+    # return times as python datetimes for consistency
+    times_dt = np.array([num2date(x).replace(tzinfo=None) for x in tnum])
+    return times_dt, freqs, data_tf
+
+def _normalize01(arr):
+    vmin = np.nanpercentile(arr, 5)
+    vmax = np.nanpercentile(arr, 99)
+    arr = (arr - vmin) / (vmax - vmin + 1e-9)
+    return np.clip(arr, 0, 1)
+
+# -----------------------------
+# ORFEES loader (your FITS structure)
+# -----------------------------
+def preprocess_log_median(data, baseline_len=100):
+    data_clipped = np.clip(data, 1e-3, None)
+    log_data = np.log10(data_clipped)
+    median_baseline = np.median(log_data[:baseline_len, :], axis=0)
+    return log_data - median_baseline
+
+def load_orfees_data(fits_file, t_start_iso, t_end_iso, f_min, f_max):
+    """
+    Returns (times_dt, freqs_MHz, data_tf) with data shape (time, freq).
+    """
+    with fits.open(fits_file) as hdul:
+        # Frequencies in 5 bands
+        freq_hdu = hdul[1].data
+        freqs = np.concatenate([
+            freq_hdu['FREQ_B1'][0],
+            freq_hdu['FREQ_B2'][0],
+            freq_hdu['FREQ_B3'][0],
+            freq_hdu['FREQ_B4'][0],
+            freq_hdu['FREQ_B5'][0]
+        ])
+
+        # Stokes I in same 5 bands (time × freq_in_band)
+        spec_hdu = hdul[2].data
+        data_i = np.hstack([
+            spec_hdu['STOKESI_B1'],
+            spec_hdu['STOKESI_B2'],
+            spec_hdu['STOKESI_B3'],
+            spec_hdu['STOKESI_B4'],
+            spec_hdu['STOKESI_B5']
+        ])
+
+    # Build ORFEES times (0.1 s cadence) — your original constant start
+    start_time = Time('2024-11-06T13:06:00', format='isot', scale='utc')
+    time_deltas = TimeDelta(np.arange(data_i.shape[0]) * 0.1, format='sec')
+    times = start_time + time_deltas
+
+    # Sort by frequency
+    order = np.argsort(freqs)
+    freqs = freqs[order]
+    data_i = data_i[:, order]
+
+    # Normalize (log-median)
+    data_i = preprocess_log_median(data_i)
+
+    # Trim time/freq
+    t_start = Time(t_start_iso, format='isot')
+    t_end   = Time(t_end_iso,   format='isot')
+    mask_t = (times >= t_start) & (times <= t_end)
+    mask_f = (freqs >= f_min) & (freqs <= f_max)
+
+    times = times[mask_t]
+    freqs = freqs[mask_f]
+    data_i = data_i[mask_t][:, mask_f]
+
+    # Convert times to naive datetimes
+    times_dt = times.to_datetime()
+
+    # Ensure order & shape
+    times_dt, freqs, data_i = _ensure_time_freq_order(times_dt, freqs, data_i)
+
+    print(f"ORFEES: data {data_i.shape}, times {len(times_dt)}, freqs {len(freqs)}")
+    return times_dt, freqs, data_i
+
+# -----------------------------
+# CALLISTO loader (your FITS structure)
+# -----------------------------
+def load_callisto_data(file):
+    """
+    Returns (times_dt, freqs_MHz, data_tf) with data shape (time, freq).
+    The raw file is freq × time in primary HDU; we flip/transpose to time × freq.
+    """
+    with fits.open(file) as hdu:
+        data = hdu[0].data.astype(np.float32)  # (freq, time)
+        hdr = hdu[0].header
+        # time axis from header
+        t_start = hdr['CRVAL1']
+        dt = hdr['CDELT1']
+        nt = hdr['NAXIS1']
+        time_sec = t_start + dt * np.arange(nt)
+        date_str = hdr['DATE-OBS']
+        base_time = datetime.strptime(date_str, "%Y/%m/%d")
+        times_dt = np.array([base_time + timedelta(seconds=float(s)) for s in time_sec])
+
+        # frequency list in ext 1
+        freqs = hdu[1].data['Frequency'][0]  # array (descending typical)
+        # flip to ascending, drop the first 6 channels as you did
+        freqs = np.flip(freqs)[6:]
+        data = np.flip(data, axis=0)[6:, :]   # still (freq, time)
+
+    # to (time, freq)
+    data_tf = data.T
+    return times_dt, freqs, data_tf
+
+def process_callisto_data(files, t_start_cal, t_end_cal, f_min, f_max):
+    """
+    files : list of file paths (already known)
+    Returns times, freqs, data_tf
+    """
+    print(f"CALLISTO: {len(files)} file(s) provided")
+
+    if not files:
+        return None
+
+    times_list, data_list = [], []
+    freqs = None
+
+    for fp in files:
+        t, f, d_tf = load_callisto_data(fp)   # load one file
+        if freqs is None:
+            freqs = f
+        else:
+            if not np.allclose(freqs, f):
+                print(f"Warning: frequency mismatch in {fp}")
+        times_list.append(t)
+        data_list.append(d_tf)
+
+    # Concatenate along time
+    times = np.concatenate(times_list)
+    data_tf = np.vstack(data_list)  # (time, freq)
+
+    # Baseline remove (median over time)
+    med = np.nanmedian(data_tf, axis=0, keepdims=True)
+    data_tf = data_tf - med
+
+    # Trim by time/freq
+    t_start = Time(t_start_cal, format='isot').to_datetime()
+    t_end   = Time(t_end_cal,   format='isot').to_datetime()
+
+    mask_t = (times >= t_start) & (times <= t_end)
+    mask_f = (freqs >= f_min) & (freqs <= f_max)
+
+    times = times[mask_t]
+    freqs = freqs[mask_f]
+    data_tf = data_tf[mask_t][:, mask_f]
+
+    times, freqs, data_tf = _ensure_time_freq_order(times, freqs, data_tf)
+
+    print(f"CALLISTO: data {data_tf.shape}, times {len(times)}, freqs {len(freqs)}")
+    return times, freqs, data_tf
+
+# -----------------------------
+# LOFAR BST loader + combine
+# -----------------------------
+def _lofar_sb_to_freq(sb=np.arange(488)):
+    def sb_to_freq_math(x, n, clock=200):
+        return ((n - 1) + (x / 512.0)) * (clock / 2.0)
+
+    sb_3 = np.arange(54, 454, 2)
+    sb_5 = np.arange(54, 454, 2)
+    sb_7 = np.arange(54, 290, 2)
+    f3 = sb_to_freq_math(sb_3, n=1)
+    f5 = sb_to_freq_math(sb_5, n=2)
+    f7 = sb_to_freq_math(sb_7, n=3)
+    freq = np.concatenate((f3, f5, f7), axis=0)
+    return freq[sb[0]:sb[-1] + 1]
+
+def _load_bst_file(bstfile, subbands=np.arange(488)):
+    data = np.fromfile(bstfile)  # flat float array
+    n_sb = len(subbands)
+    valid_len = (data.shape[0] // n_sb) * n_sb
+    data = data[:valid_len].reshape(-1, n_sb)   # (time, subband)
+    data = np.clip(data, 1e-6, None)
+    logd = np.log10(data)
+    med = np.median(logd[:100, :], axis=0)
+    data_tf = (logd - med)  # (time, subband)
+    #data_tf = data_tf * 100
+    freqs = _lofar_sb_to_freq(subbands)
+    # time from filename
+    obs_start_str = bstfile[-27:-12]  # e.g. 20241106_130610
+    obs_start = datetime.strptime(obs_start_str, "%Y%m%d_%H%M%S")
+    times = np.array([obs_start + timedelta(seconds=i) for i in range(data_tf.shape[0])])
+    # Orient to (time, freq)
+    return times, freqs, data_tf
+
+def combine_two_lofar(file1, file2, f_min, f_max):
+    t1, f1, d1 = _load_bst_file(file1)
+    t2, f2, d2 = _load_bst_file(file2)
+    # Ensure same freqs and select band
+    mask1 = (f1 >= f_min) & (f1 <= f_max)
+    mask2 = (f2 >= f_min) & (f2 <= f_max)
+    fsel1 = f1[mask1]; fsel2 = f2[mask2]
+    if not np.allclose(fsel1, fsel2):
+        raise ValueError("LOFAR: frequency axes do not match between files.")
+    # Concatenate along time
+    times = np.concatenate([t1, t2])
+    data_tf = np.vstack([d1[:, mask1], d2[:, mask2]])  # (time, freq)
+    times, fsel1, data_tf = _ensure_time_freq_order(times, fsel1, data_tf)
+    print(f"LOFAR: data {data_tf.shape}, times {len(times)}, freqs {len(fsel1)}")
+    return times, fsel1, data_tf
+
+# -----------------------------
+# Combine all instruments
+# -----------------------------
+def combine_data(orfees, callisto, lofar, time_range_iso, f_min_total, f_max_total,
+                 df_points=600):
+    """
+    Returns time_grid_dt, freqs_grid, combined (time, freq)
+    """
+    t0 = Time(time_range_iso[0], format='isot').to_datetime()
+    t1 = Time(time_range_iso[1], format='isot').to_datetime()
+    total_seconds = int((t1 - t0).total_seconds())
+    # 1-second grid
+    time_grid_dt = np.array([t0 + timedelta(seconds=i) for i in range(total_seconds + 1)])
+    time_grid_num = date2num(time_grid_dt)
+
+    freqs_grid = np.linspace(f_min_total, f_max_total, df_points)
+    stack = []
+
+    for label, ds in [("ORFEES", orfees), ("CALLISTO", callisto), ("LOFAR", lofar)]:
+        if ds is None:
+            continue
+        times, freqs, data_tf = ds  # (nt,), (nf,), (nt,nf)
+        # normalize per-instrument
+        data_tf = _normalize01(data_tf)
+
+        # ensure order/shape
+        times, freqs, data_tf = _ensure_time_freq_order(times, freqs, data_tf)
+
+        # Interpolate onto common grid
+        tnum = date2num(times)
+        interp = RegularGridInterpolator((tnum, freqs), data_tf,
+                                         bounds_error=False, fill_value=np.nan)
+        TT, FF = np.meshgrid(time_grid_num, freqs_grid, indexing='ij')
+        vals = interp(np.column_stack([TT.ravel(), FF.ravel()]))
+        vals = vals.reshape(len(time_grid_dt), len(freqs_grid))
+        stack.append(vals)
+
+        #print(f"{label}: mapped -> grid {vals.shape}")
+
+    if not stack:
+        raise RuntimeError("No datasets loaded; combined stack is empty.")
+
+    combined = np.nanmean(stack, axis=0)
+    return time_grid_dt, freqs_grid, combined
+
+# -----------------------------
+# Plotting
+# -----------------------------
+def plot_combined_spectrum(time_grid_dt, freqs, data, time_range_iso, title):
+    fig, ax = plt.subplots(figsize=(8, 4))
+    tnum = date2num(time_grid_dt)
+    vmin, vmax = np.nanpercentile(data, [1, 99])
+    pcm = ax.pcolormesh(tnum, freqs, data.T, shading='auto', cmap='inferno',
+                        vmin=vmin, vmax=vmax)
+    ax.set_ylabel('Frequency (MHz)')
+    ax.set_xlabel('Time (UT, 2024-11-06)')
+    ax.set_title(title)
+    ax.xaxis_date()
+    ax.xaxis.set_major_formatter(DateFormatter('%H:%M:%S'))
+    t_start = Time(time_range_iso[0], format='isot').to_datetime()
+    t_end   = Time(time_range_iso[1], format='isot').to_datetime()
+    ax.set_xlim(date2num(t_start), date2num(t_end))
+    ax.set_ylim(freqs.min(), freqs.max())
+    #cbar = fig.colorbar(pcm, ax=ax, label="Normalized intensity")
+    fig.autofmt_xdate()
+    plt.tight_layout()
+   # ax.set_yscale('log')
+   # Optional: log y-axis
+    ax.set_yscale('log')
+    ax.yaxis.set_major_locator(LogLocator(base=10.0, subs=[200, 300, 400, 500, 600, 700], numticks=15))
+    ax.yaxis.set_major_formatter(ScalarFormatter()) # show numbers instead of scientific notation
+    ax.yaxis.set_minor_formatter(ScalarFormatter())
+    ax.ticklabel_format(style='plain', axis='y') 
+    plt.savefig('combined_dynamic_spectrum_with_lofar.png', dpi=300, bbox_inches='tight')
+    # Add cursor that follows mouse
+    cursor = Cursor(ax, horizOn=True, vertOn=True, color='red', linewidth=1)
+    plt.show()
+
+   
+def plot_time_profiles(time_grid_dt, freqs_combined, data_combined, time_range, chosen_freqs):
+    plt.figure(figsize=(10, 4))
+    for f in chosen_freqs:
+        idx = np.argmin(np.abs(freqs_combined - f))
+        plt.plot(time_grid_dt, data_combined[:, idx], label=f"{freqs_combined[idx]:.0f} MHz")
+    plt.xlabel("Time [UT]")
+    plt.ylabel("Intensity")
+    plt.title("Time Profiles at Selected Frequencies")
+    plt.legend()
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+    t_start = Time(time_range[0], format='isot').to_datetime()
+    t_end   = Time(time_range[1], format='isot').to_datetime()
+    plt.xlim(t_start, t_end)
+    plt.tight_layout()
+    plt.show()
+
+# -----------------------------
+# Main
+# -----------------------------
+if __name__ == "__main__":
+    # INPUT FILES
+    orfees_file = 'int_orf20241106_130000_0.1.fts'
+    #callisto_dir = "udaipur_20241106"
+    callisto_files = [
+    "udaipur_20241106/HUMAIN_20241106_134500_59.fit.gz",
+    "udaipur_20241106/HUMAIN_20241106_140000_59.fit.gz",
+    "udaipur_20241106/HUMAIN_20241106_141500_59.fit.gz"
+    ]
+    lofar_file1 = '20241106_130610_bst_00X.dat'
+    lofar_file2 = '20241106_142709_bst_00X.dat'
+
+    # TIME RANGE + FREQ RANGE
+    time_range = ('2024-11-06T13:45:00', '2024-11-06T14:00:00')
+    f_min_total, f_max_total = 144.0, 700.0
+
+    # LOAD
+    lofar_data = combine_two_lofar(lofar_file1, lofar_file2, f_min=20, f_max=30)
+    callisto_data = process_callisto_data(callisto_files,time_range[0], time_range[1],f_min=50, f_max=144)
+    orfees_data = load_orfees_data(orfees_file, time_range[0], time_range[1], f_min=144, f_max=700)
+
+    # COMBINE
+    time_grid_dt, freqs_combined, data_combined =combine_data(orfees_data, callisto_data, lofar_data, time_range, f_min_total, f_max_total)
+
+    # PLOT
+    plot_combined_spectrum(time_grid_dt, freqs_combined, data_combined, time_range,
+                           'Combined Dynamic Spectrum (ORFEES, CALLISTO, LOFAR) - 2024-11-06')
+
+# Plot time profiles at chosen frequencies
+    chosen_freqs = [430,450]
+    plot_time_profiles(time_grid_dt, freqs_combined, data_combined, time_range, chosen_freqs)
